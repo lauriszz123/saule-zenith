@@ -1,0 +1,249 @@
+--- Two networks that actually train.
+---
+--- XOR first, because it is the smallest problem a linear model cannot
+--- solve — if the loss falls, the hidden layer and the gradients through
+--- it are both doing real work. Then a three-class classifier, to put
+--- softmax cross-entropy, Adam and mini-batching through the same test.
+---
+--- Both runs assert their own outcome at the end, so this file fails
+--- loudly rather than printing a plausible-looking curve that went nowhere.
+
+import * from "numsol"
+import * from "zenith"
+
+class Main
+  static fn main()
+    Math.randomseed(20261012)
+
+    Main.xor()
+    Main.classify()
+
+    println("")
+    println("both networks trained.")
+  end
+
+  -- ------------------------------------------------------------------ XOR
+
+  static fn xor()
+    println("-- XOR --")
+    println("")
+
+    -- Four points, two features. XOR is not linearly separable, so a bare
+    -- `Linear(2, 1)` is stuck at chance no matter how long it trains.
+    local inputs: Tensor = Tensor.constant(Num.matrix({
+      {0.0, 0.0},
+      {0.0, 1.0},
+      {1.0, 0.0},
+      {1.0, 1.0}
+    }))
+
+    local targets: Tensor = Tensor.constant(Num.matrix({
+      {0.0},
+      {1.0},
+      {1.0},
+      {0.0}
+    }))
+
+    local net: Sequential = Sequential({
+      Linear(2, 8),
+      Tanh(),
+      Linear(8, 1)
+    })
+
+    local opt: Optimizer = Adam(net.parameters(), 0.05)
+
+    local first: float = 0.0
+    local last: float = 0.0
+
+    for epoch: integer = 1, 400 do
+      -- The four lines every training loop in every framework has.
+      opt.zeroGrad()
+
+      local logits: Tensor = net.forward(inputs)
+      local loss: Tensor = Loss.bceWithLogits(logits, targets)
+
+      loss.backward()
+      opt.step()
+
+      last = loss.item()
+
+      if epoch == 1 then
+        first = last
+      end
+
+      if epoch % 50 == 0 or epoch == 1 then
+        printf("  epoch %3d   loss %.5f   accuracy %.0f%%\n", epoch, last,
+          Metrics.binaryAccuracy(logits, targets) * 100.0)
+      end
+    end
+
+    println("")
+    println("  predictions")
+
+    -- The network outputs logits; a sigmoid turns them into probabilities.
+    local probabilities: NDArray = net.forward(inputs).sigmoid().getValue()
+    local data: NDArray = inputs.getValue()
+    local truth: NDArray = targets.getValue()
+    local correct: integer = 0
+
+    for r: integer = 1, 4 do
+      local p: float = probabilities.get({r, 1})
+      local expected: float = truth.get({r, 1})
+      local rounded: float = 0.0
+
+      if p > 0.5 then
+        rounded = 1.0
+      end
+
+      if rounded == expected then
+        correct = correct + 1
+      end
+
+      printf("    %.0f xor %.0f  ->  %.4f   (want %.0f)\n",
+        data.get({r, 1}), data.get({r, 2}), p, expected)
+    end
+
+    println("")
+    printf("  loss %.5f -> %.5f, %d of 4 correct\n", first, last, correct)
+
+    if correct != 4 then
+      throw "zenith: XOR did not converge — got " .. correct .. " of 4"
+    end
+
+    if last > first / 10.0 then
+      throw "zenith: XOR loss barely moved"
+    end
+  end
+
+  -- ------------------------------------------------- three-class softmax
+
+  static fn classify()
+    println("")
+    println("-- three clusters --")
+    println("")
+
+    local perClass: integer = 40
+    local total: integer = perClass * 3
+
+    local features: NDArray = Main.clusters(perClass)
+    local labels: table<integer> = Main.labels(total)
+
+    local net: Sequential = Sequential({
+      Linear(2, 16),
+      ReLU(),
+      Linear(16, 3)
+    })
+
+    local opt: Optimizer = SGD(net.parameters(), 0.1, 0.9)
+
+    local batch: integer = 20
+    local batches: integer = total / batch
+
+    for epoch: integer = 1, 60 do
+      local running: float = 0.0
+
+      for b: integer = 1, batches do
+        local firstRow: integer = (b - 1) * batch + 1
+        local lastRow: integer = b * batch
+
+        -- `slice` cuts the mini-batch out of the full matrix; the labels
+        -- are sliced the same way.
+        local x: Tensor = Tensor.constant(features.slice(firstRow, lastRow))
+        local y: table<integer> = Main.slice(labels, firstRow, lastRow)
+
+        opt.zeroGrad()
+
+        local loss: Tensor = Loss.crossEntropy(net.forward(x), y)
+
+        loss.backward()
+        opt.step()
+
+        running = running + loss.item()
+      end
+
+      if epoch % 10 == 0 or epoch == 1 then
+        local logits: Tensor = net.forward(Tensor.constant(features))
+
+        printf("  epoch %3d   loss %.5f   accuracy %.1f%%\n", epoch,
+          running / (batches as float),
+          Metrics.accuracy(logits, labels) * 100.0)
+      end
+    end
+
+    local final: Tensor = net.forward(Tensor.constant(features))
+    local accuracy: float = Metrics.accuracy(final, labels)
+
+    println("")
+    printf("  final accuracy %.1f%% on %d points\n", accuracy * 100.0, total)
+
+    -- Softmax rows are probabilities, so they sum to one. Worth checking
+    -- once: it is the cheapest possible test that the fused loss and the
+    -- standalone softmax agree about what the network said.
+    local probabilities: NDArray = final.softmax(2).getValue()
+    local rowSums: NDArray = probabilities.sumAxis(2)
+
+    printf("  softmax rows sum to %.6f\n", rowSums.mean())
+
+    if Math.abs(rowSums.mean() - 1.0) > 0.000001 then
+      throw "zenith: softmax rows do not sum to one"
+    end
+
+    if accuracy < 0.9 then
+      throw "zenith: classifier only reached " .. (accuracy * 100.0) .. "%"
+    end
+  end
+
+  --- Three Gaussian blobs in 2-D, interleaved one class after another so
+  --- sequential mini-batches stay balanced without a shuffle.
+  static fn clusters(perClass: integer) -> NDArray
+    local centres: table<table<float>> = {
+      {-2.0, -2.0},
+      {2.0, -2.0},
+      {0.0, 2.5}
+    }
+
+    -- Wide enough that the clusters overlap at the edges, so epoch 1 is
+    -- nowhere near solved and the curve below shows real learning.
+    local spread: float = 1.3
+    local data: table<float> = {}
+
+    for i: integer = 1, perClass do
+      for c: integer = 1, 3 do
+        local centre: table<float> = centres[c]
+
+        data[#data + 1] = centre[1] + Main.gauss() * spread
+        data[#data + 1] = centre[2] + Main.gauss() * spread
+      end
+    end
+
+    return Num.shaped(data, {perClass * 3, 2})
+  end
+
+  --- The labels matching `clusters`: 1, 2, 3, 1, 2, 3, …
+  static fn labels(total: integer) -> table<integer>
+    local out: table<integer> = {}
+
+    for i: integer = 1, total do
+      out[i] = (i - 1) % 3 + 1
+    end
+
+    return out
+  end
+
+  --- One standard normal. `Num.randn` makes whole arrays of them; this is
+  --- the one-at-a-time form, for building a dataset element by element.
+  static fn gauss() -> float
+    return Num.randn({1}).item()
+  end
+
+  --- `labels[first..last]`, 1-based and inclusive.
+  static fn slice(labels: table<integer>, first: integer, last: integer) -> table<integer>
+    local out: table<integer> = {}
+
+    for i: integer = first, last do
+      out[#out + 1] = labels[i]
+    end
+
+    return out
+  end
+end

@@ -1,0 +1,216 @@
+--- loss.sau — objective functions.
+---
+--- `mse` is built from the ordinary differentiable operators, so it is also
+--- a worked example of how to write your own. `crossEntropy` and
+--- `bceWithLogits` are instead *fused*: they take raw logits and compute
+--- the softmax (or sigmoid) and the loss in one node with a hand-written
+--- gradient. That is not an optimisation — composing `log` after `softmax`
+--- loses precision and can hand `log` a zero, while the fused form reduces
+--- to `probability - truth`, which is both exact and cheap.
+
+import * from "numsol"
+import Tensor from "tensor"
+
+--- Smallest probability `log` is allowed to see. 1e-12, written out
+--- because Saule has no exponent literals.
+local logFloor: float = 0.000000000001
+
+export class Loss
+  --- Mean squared error. Both tensors must have the same shape.
+  static fn mse(pred: Tensor, target: Tensor) -> Tensor
+    local diff: Tensor = pred - target
+
+    return (diff * diff).mean()
+  end
+
+  --- Mean absolute error, via `sqrt(d² + ε)` so the kink at zero has a
+  --- finite slope.
+  static fn mae(pred: Tensor, target: Tensor) -> Tensor
+    local diff: Tensor = pred - target
+
+    return (diff * diff + logFloor).sqrt().mean()
+  end
+
+  --- Softmax cross-entropy from raw logits.
+  ---
+  --- `logits` is `(batch, classes)`; `targets` holds one **1-based** class
+  --- index per row. The result is the mean loss over the batch, and the
+  --- gradient that reaches `logits` is `(softmax - onehot) / batch`.
+  static fn crossEntropy(logits: Tensor, targets: table<integer>) -> Tensor
+    local values: NDArray = logits.getValue()
+
+    if values.rank() != 2 then
+      throw "zenith: crossEntropy needs (batch, classes) logits, got "
+        .. values.shapeString()
+    end
+
+    local batch: integer = values.dim(1)
+    local classes: integer = values.dim(2)
+
+    if #targets != batch then
+      throw "zenith: crossEntropy got " .. #targets .. " targets for a batch of "
+        .. batch
+    end
+
+    -- Shift each row by its maximum before exponentiating: mathematically
+    -- a no-op on the softmax, and the difference between an answer and an
+    -- overflow.
+    local shifted: NDArray = values - values.maxAxis(2, true)
+    local exps: NDArray = shifted.exp()
+    local probs: NDArray = exps / exps.sumAxis(2, true)
+
+    local total: float = 0.0
+
+    for b: integer = 1, batch do
+      local target: integer = targets[b]
+
+      if target < 1 or target > classes then
+        throw "zenith: target " .. target .. " out of range 1.." .. classes
+          .. " at row " .. b
+      end
+
+      total = total - Math.log(Math.max(probs.get({b, target}), logFloor))
+    end
+
+    local out: Tensor = Tensor.node(
+      Num.scalar(total / (batch as float)),
+      {logits}
+    )
+
+    out.setBackward(fn()
+      local share: float = out.gradient().item() / (batch as float)
+      local g: NDArray = probs.copy()
+
+      for b: integer = 1, batch do
+        local target: integer = targets[b]
+        g.set({b, target}, g.get({b, target}) - 1.0)
+      end
+
+      logits.accumulate(g * share)
+    end)
+
+    return out
+  end
+
+  --- Binary cross-entropy from raw logits, elementwise then averaged.
+  ---
+  --- Computed as `max(z, 0) - z·y + log(1 + e^-|z|)`, the form that stays
+  --- finite for any logit — the naive `-y·log(σ(z))` overflows on one side
+  --- and takes `log(0)` on the other. The gradient is `(σ(z) - y) / n`.
+  static fn bceWithLogits(logits: Tensor, targets: Tensor) -> Tensor
+    local z: NDArray = logits.getValue()
+    local y: NDArray = targets.getValue()
+
+    if not z.hasShape(y.getShape()) then
+      throw "zenith: bceWithLogits shape mismatch — logits " .. z.shapeString()
+        .. " against targets " .. y.shapeString()
+    end
+
+    local count: integer = z.size()
+    local total: float = 0.0
+
+    for i: integer = 1, count do
+      local logit: float = z.at(i)
+      local truth: float = y.at(i)
+
+      total = total + Math.max(logit, 0.0) - logit * truth
+        + Math.log(1.0 + Math.exp(-Math.abs(logit)))
+    end
+
+    local out: Tensor = Tensor.node(
+      Num.scalar(total / (count as float)),
+      {logits}
+    )
+
+    out.setBackward(fn()
+      local share: float = out.gradient().item() / (count as float)
+      local g: NDArray = Num.zerosLike(z)
+
+      for i: integer = 1, count do
+        local logit: float = z.at(i)
+        local p: float = 0.0
+
+        if logit >= 0.0 then
+          p = 1.0 / (1.0 + Math.exp(-logit))
+        else
+          local e: float = Math.exp(logit)
+          p = e / (1.0 + e)
+        end
+
+        g.setAt(i, (p - y.at(i)) * share)
+      end
+
+      logits.accumulate(g)
+    end)
+
+    return out
+  end
+end
+
+export class Metrics
+  --- Fraction of rows whose largest logit is the target class. `targets`
+  --- holds 1-based class indices.
+  static fn accuracy(logits: Tensor, targets: table<integer>) -> float
+    local picks: NDArray = logits.getValue().argmaxAxis(2)
+    local hits: integer = 0
+
+    for b: integer = 1, #targets do
+      if (picks.at(b) as integer) == targets[b] then
+        hits = hits + 1
+      end
+    end
+
+    local count: integer = #targets
+
+    if count == 0 then
+      return 0.0
+    end
+
+    return (hits as float) / (count as float)
+  end
+
+  --- Fraction of elements on the right side of `threshold`, for a binary
+  --- head whose targets are 0.0 or 1.0.
+  static fn binaryAccuracy(logits: Tensor, targets: Tensor, threshold: float = 0.0) -> float
+    local z: NDArray = logits.getValue()
+    local y: NDArray = targets.getValue()
+    local count: integer = z.size()
+
+    if count == 0 then
+      return 0.0
+    end
+
+    local hits: integer = 0
+
+    for i: integer = 1, count do
+      local predicted: float = 0.0
+
+      if z.at(i) > threshold then
+        predicted = 1.0
+      end
+
+      if predicted == y.at(i) then
+        hits = hits + 1
+      end
+    end
+
+    return (hits as float) / (count as float)
+  end
+
+  --- One-hot rows from 1-based class indices: `(batch, classes)`.
+  static fn oneHot(targets: table<integer>, classes: integer) -> NDArray
+    local out: NDArray = Num.zeros({#targets, classes})
+
+    for b: integer = 1, #targets do
+      local target: integer = targets[b]
+
+      if target < 1 or target > classes then
+        throw "zenith: target " .. target .. " out of range 1.." .. classes
+      end
+
+      out.set({b, target}, 1.0)
+    end
+
+    return out
+  end
+end

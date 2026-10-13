@@ -1,0 +1,42 @@
+--[[
+Zenith — neural networks for Saule.
+
+A define-by-run autograd engine over numsol arrays, plus the layers,
+losses and optimisers that make it a framework rather than a derivative
+calculator. If you know PyTorch, you know this:
+
+    import * from "zenith"
+    import * from "numsol"
+
+    local net: Sequential = Sequential({
+      Linear(2, 8), Tanh(), Linear(8, 1)
+    })
+
+    local opt: Optimizer = Adam(net.parameters(), 0.05)
+
+    for epoch: integer = 1, 500 do
+      opt.zeroGrad()
+      local loss: Tensor = Loss.mse(net.forward(x), y)
+      loss.backward()
+      opt.step()
+    end
+
+What `import * from "zenith"` brings in:
+
+  Tensor                       an array that remembers its own history
+  Module                       the layer contract: forward + parameters
+  Linear Sequential            the layers
+  ReLU LeakyReLU Tanh
+  Sigmoid Softmax              the activations
+  Loss                         mse, mae, crossEntropy, bceWithLogits
+  Metrics                      accuracy, binaryAccuracy, oneHot
+  Optimizer SGD Adam           the updates
+
+Zenith re-exports nothing from numsol, so a program that touches arrays
+directly imports both.
+]]
+
+import * from tensor
+import * from module
+import * from loss
+import * from optim

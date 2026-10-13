@@ -1,0 +1,230 @@
+--- module.sau — layers, and the contract they share.
+---
+--- A `Module` is anything that turns one tensor into another and can list
+--- the parameters an optimiser is allowed to move. That is the whole
+--- interface, so your own layer is a first-class citizen the moment it
+--- implements two methods:
+---
+---     export class Scale implements Module
+---       local factor: Tensor
+---
+---       fn init(start: float)
+---         self.factor = Tensor.parameter(Num.scalar(start), "factor")
+---       end
+---
+---       fn forward(input: Tensor) -> Tensor
+---         return input * self.factor
+---       end
+---
+---       fn parameters() -> table<Tensor>
+---         return {self.factor}
+---       end
+---     end
+
+import * from "numsol"
+import Tensor from "tensor"
+
+export interface Module
+  fn forward(input: Tensor) -> Tensor
+  fn parameters() -> table<Tensor>
+end
+
+--- A fully connected layer: `input @ weight + bias`.
+---
+--- `input` is `(batch, inFeatures)` and the result is
+--- `(batch, outFeatures)`. The weights start from Glorot uniform —
+--- `±sqrt(6 / (in + out))` — which keeps the activations' variance roughly
+--- steady through a deep stack instead of letting it collapse or explode.
+export class Linear implements Module
+  local weight: Tensor
+  local bias: Tensor?
+  local inFeatures: integer
+  local outFeatures: integer
+
+  fn init(inFeatures: integer, outFeatures: integer, bias: boolean = true)
+    self.inFeatures = inFeatures
+    self.outFeatures = outFeatures
+
+    local limit: float = Math.sqrt(6.0 / ((inFeatures + outFeatures) as float))
+
+    self.weight = Tensor.parameter(
+      Num.uniform({inFeatures, outFeatures}, -limit, limit),
+      "weight"
+    )
+
+    if bias then
+      self.bias = Tensor.parameter(Num.zeros({1, outFeatures}), "bias")
+    end
+  end
+
+  fn forward(input: Tensor) -> Tensor
+    local out: Tensor = input.matmul(self.weight)
+    local b: Tensor? = self.bias
+
+    if b == nil then
+      return out
+    end
+
+    -- `(batch, out) + (1, out)`: the bias row broadcasts across the batch,
+    -- and its gradient is summed back down by `unbroadcast`.
+    return out + b!
+  end
+
+  fn parameters() -> table<Tensor>
+    local b: Tensor? = self.bias
+
+    if b == nil then
+      return {self.weight}
+    end
+
+    return {self.weight, b!}
+  end
+
+  --- The weight matrix, `(inFeatures, outFeatures)`.
+  fn getWeight() -> Tensor
+    return self.weight
+  end
+
+  --- The bias row, `(1, outFeatures)`, or nil on a bias-free layer.
+  fn getBias() -> Tensor?
+    return self.bias
+  end
+
+  --- Replace the weights — for loading a checkpoint, or for a different
+  --- initialisation scheme such as He for a deep ReLU stack.
+  fn setWeight(value: NDArray) -> nil
+    if not value.hasShape({self.inFeatures, self.outFeatures}) then
+      throw "zenith: Linear expects weights of shape ("
+        .. self.inFeatures .. ", " .. self.outFeatures .. "), got "
+        .. value.shapeString()
+    end
+
+    self.weight.setValue(value)
+  end
+
+  fn toString() -> string
+    return "Linear(" .. self.inFeatures .. " -> " .. self.outFeatures .. ")"
+  end
+end
+
+--- `max(x, 0)`, the default hidden activation.
+export class ReLU implements Module
+  fn forward(input: Tensor) -> Tensor
+    return input.relu()
+  end
+
+  fn parameters() -> table<Tensor>
+    return {}
+  end
+end
+
+--- `tanh`, squashing into `(-1, 1)`.
+export class Tanh implements Module
+  fn forward(input: Tensor) -> Tensor
+    return input.tanh()
+  end
+
+  fn parameters() -> table<Tensor>
+    return {}
+  end
+end
+
+--- Logistic sigmoid, squashing into `(0, 1)`. For a binary classifier,
+--- prefer leaving the logits raw and using `Loss.bceWithLogits`, which is
+--- the same function fused with its loss and numerically steadier.
+export class Sigmoid implements Module
+  fn forward(input: Tensor) -> Tensor
+    return input.sigmoid()
+  end
+
+  fn parameters() -> table<Tensor>
+    return {}
+  end
+end
+
+--- Softmax along the class axis. Same caution as `Sigmoid`: for training,
+--- `Loss.crossEntropy` takes raw logits and is better behaved.
+export class Softmax implements Module
+  local axis: integer
+
+  fn init(axis: integer = 2)
+    self.axis = axis
+  end
+
+  fn forward(input: Tensor) -> Tensor
+    return input.softmax(self.axis)
+  end
+
+  fn parameters() -> table<Tensor>
+    return {}
+  end
+end
+
+--- Leaky ReLU: a small slope below zero, so a unit that lands in the
+--- negative half still receives gradient.
+export class LeakyReLU implements Module
+  local slope: float
+
+  fn init(slope: float = 0.01)
+    self.slope = slope
+  end
+
+  fn forward(input: Tensor) -> Tensor
+    -- max(x, 0) + slope * min(x, 0), both built from differentiable parts.
+    local positive: Tensor = input.relu()
+    local negative: Tensor = input.neg().relu() * (-self.slope)
+
+    return positive + negative
+  end
+
+  fn parameters() -> table<Tensor>
+    return {}
+  end
+end
+
+--- Layers applied in order. This is the usual way to spell a network:
+---
+---     local net: Sequential = Sequential({
+---       Linear(2, 8), ReLU(), Linear(8, 1)
+---     })
+export class Sequential implements Module
+  local layers: table<Module>
+
+  fn init(layers: table<Module>)
+    self.layers = layers
+  end
+
+  --- Append a layer. Returns `self` so construction chains.
+  fn push(layer: Module) -> Sequential
+    self.layers[#self.layers + 1] = layer
+
+    return self
+  end
+
+  --- The layers, in order.
+  fn getLayers() -> table<Module>
+    return self.layers
+  end
+
+  fn forward(input: Tensor) -> Tensor
+    local current: Tensor = input
+
+    for layer: Module in self.layers do
+      current = layer.forward(current)
+    end
+
+    return current
+  end
+
+  fn parameters() -> table<Tensor>
+    local out: table<Tensor> = {}
+
+    for layer: Module in self.layers do
+      for p: Tensor in layer.parameters() do
+        out[#out + 1] = p
+      end
+    end
+
+    return out
+  end
+end

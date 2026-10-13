@@ -1,0 +1,186 @@
+--- optim.sau — parameter updates.
+---
+--- An optimiser holds the parameter list a module handed it, and walks it
+--- once per step. Updates are applied **in place** to each parameter's
+--- array, so no tensor identity changes and the graph built by the next
+--- forward pass points at the same leaves.
+---
+---     local opt: Optimizer = Adam(net.parameters(), 0.01)
+---
+---     opt.zeroGrad()
+---     local loss: Tensor = Loss.mse(net.forward(x), y)
+---     loss.backward()
+---     opt.step()
+---
+--- `zeroGrad` comes first because gradients accumulate on leaves, the same
+--- contract PyTorch has. Forget it and every step sees the sum of every
+--- batch so far.
+
+import * from "numsol"
+import Tensor from "tensor"
+
+export interface Optimizer
+  fn step() -> nil
+  fn zeroGrad() -> nil
+  fn parameters() -> table<Tensor>
+end
+
+--- Stochastic gradient descent, with optional classical momentum and
+--- L2 weight decay.
+---
+--- With `momentum`, the update carries a running velocity
+--- `v = μv + g` and steps along that instead of along the raw gradient,
+--- which damps the zig-zag across a narrow valley.
+export class SGD implements Optimizer
+  local params: table<Tensor>
+  local lr: float
+  local momentum: float
+  local weightDecay: float
+  local velocity: table<NDArray>
+
+  fn init(params: table<Tensor>, lr: float = 0.01, momentum: float = 0.0,
+    weightDecay: float = 0.0)
+
+    self.params = params
+    self.lr = lr
+    self.momentum = momentum
+    self.weightDecay = weightDecay
+    self.velocity = {}
+
+    for i: integer = 1, #params do
+      self.velocity[i] = Num.zerosLike(params[i].getValue())
+    end
+  end
+
+  fn step() -> nil
+    for i: integer = 1, #self.params do
+      local p: Tensor = self.params[i]
+      local g: NDArray = p.gradient()
+
+      if self.weightDecay != 0.0 then
+        g = g + p.getValue() * self.weightDecay
+      end
+
+      if self.momentum != 0.0 then
+        local v: NDArray = self.velocity[i]
+        v.scaleInPlace(self.momentum).addInPlace(g)
+        g = v
+      end
+
+      -- In place: `getValue()` hands back the live array.
+      p.getValue().addInPlace(g * (-self.lr))
+    end
+  end
+
+  fn zeroGrad() -> nil
+    for p: Tensor in self.params do
+      p.zeroGrad()
+    end
+  end
+
+  fn parameters() -> table<Tensor>
+    return self.params
+  end
+
+  --- The learning rate, for a schedule to read.
+  fn getLearningRate() -> float
+    return self.lr
+  end
+
+  --- Set the learning rate — decay it between epochs if you like.
+  fn setLearningRate(lr: float) -> nil
+    self.lr = lr
+  end
+end
+
+--- Adam: per-parameter step sizes from running estimates of the gradient's
+--- mean and of its square.
+---
+--- `m` tracks the mean and `v` the uncentred variance; dividing one by the
+--- square root of the other makes the step scale-free, so a parameter with
+--- tiny gradients still moves. Both start at zero, which biases them
+--- toward zero early on — `beta^t` in the denominators is the correction
+--- for exactly that, and it is why this optimiser counts its steps.
+export class Adam implements Optimizer
+  local params: table<Tensor>
+  local lr: float
+  local beta1: float
+  local beta2: float
+  local epsilon: float
+  local weightDecay: float
+  local first: table<NDArray>
+  local second: table<NDArray>
+  local steps: integer
+
+  fn init(params: table<Tensor>, lr: float = 0.001, beta1: float = 0.9,
+    beta2: float = 0.999, weightDecay: float = 0.0)
+
+    self.params = params
+    self.lr = lr
+    self.beta1 = beta1
+    self.beta2 = beta2
+    -- 1e-8, written out: no exponent literals in Saule.
+    self.epsilon = 0.00000001
+    self.weightDecay = weightDecay
+    self.first = {}
+    self.second = {}
+    self.steps = 0
+
+    for i: integer = 1, #params do
+      self.first[i] = Num.zerosLike(params[i].getValue())
+      self.second[i] = Num.zerosLike(params[i].getValue())
+    end
+  end
+
+  fn step() -> nil
+    self.steps = self.steps + 1
+
+    local biasFirst: float = 1.0 - self.beta1 ^ (self.steps as float)
+    local biasSecond: float = 1.0 - self.beta2 ^ (self.steps as float)
+
+    for i: integer = 1, #self.params do
+      local p: Tensor = self.params[i]
+      local g: NDArray = p.gradient()
+
+      if self.weightDecay != 0.0 then
+        g = g + p.getValue() * self.weightDecay
+      end
+
+      local m: NDArray = self.first[i]
+      local v: NDArray = self.second[i]
+
+      -- m = β₁m + (1 - β₁)g
+      m.scaleInPlace(self.beta1).addInPlace(g * (1.0 - self.beta1))
+      -- v = β₂v + (1 - β₂)g²
+      v.scaleInPlace(self.beta2).addInPlace(g * g * (1.0 - self.beta2))
+
+      local corrected: NDArray = m / biasFirst
+      local spread: NDArray = (v / biasSecond).sqrt() + self.epsilon
+
+      p.getValue().addInPlace(corrected / spread * (-self.lr))
+    end
+  end
+
+  fn zeroGrad() -> nil
+    for p: Tensor in self.params do
+      p.zeroGrad()
+    end
+  end
+
+  fn parameters() -> table<Tensor>
+    return self.params
+  end
+
+  --- How many `step()` calls have landed — the `t` in the bias correction.
+  fn getSteps() -> integer
+    return self.steps
+  end
+
+  fn getLearningRate() -> float
+    return self.lr
+  end
+
+  fn setLearningRate(lr: float) -> nil
+    self.lr = lr
+  end
+end

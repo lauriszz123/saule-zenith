@@ -1,0 +1,609 @@
+--- tensor.sau — reverse-mode automatic differentiation over numsol arrays.
+---
+--- A `Tensor` is an `NDArray` that remembers where it came from. Every
+--- operation on one builds a node recording its inputs and a closure that
+--- knows how to push a gradient back through that one step. `backward()`
+--- walks the graph in reverse topological order and runs those closures,
+--- so a whole network's gradients fall out of the ordinary forward code —
+--- the tape is the program, exactly as in PyTorch.
+---
+---     local w: Tensor = Tensor.parameter(Num.randn({2, 1}))
+---     local loss: Tensor = Loss.mse(x.matmul(w), y)
+---
+---     loss.backward()
+---     println(w.gradient())
+---
+--- ## Operators
+---
+--- The arithmetic operators build graph nodes, and the right-hand side may
+--- be another tensor, a plain `NDArray`, a lone `float` or a
+--- `table<float>` — anything that is not already a tensor becomes a
+--- constant leaf that takes no gradient:
+---
+---     local y: Tensor = (x * 2.0 + 1.0).tanh()
+---     local cost: Tensor = ((y - target) ^ 2.0).mean()
+---
+--- As with arrays, arithmetic dispatches on its **left** operand, so the
+--- tensor goes first; and `*` is elementwise, while `matmul` is the matrix
+--- product.
+---
+--- The graph is rebuilt on every forward pass, so intermediate nodes are
+--- garbage from the moment the step ends. Gradients on *leaves* accumulate
+--- across calls, which is why an optimiser calls `zeroGrad()` first.
+
+import * from "numsol"
+
+--- Reduce `g` back to `dims` by undoing a broadcast: axes that were
+--- invented are summed away, and axes that were stretched from 1 are
+--- summed back down to 1. Without this, the gradient of `x + bias` would
+--- have the batch's shape rather than the bias's.
+fn unbroadcast(g: NDArray, dims: table<integer>) -> NDArray
+  local out: NDArray = g
+
+  while out.rank() > #dims do
+    out = out.sumAxis(1, false)
+  end
+
+  for k: integer = 1, #dims do
+    if dims[k] == 1 and out.dim(k) != 1 then
+      out = out.sumAxis(k, true)
+    end
+  end
+
+  if not out.hasShape(dims) then
+    out = out.reshape(dims)
+  end
+
+  return out
+end
+
+export class Tensor implements OpAdd<any, Tensor>, OpSub<any, Tensor>,
+  OpMul<any, Tensor>, OpDiv<any, Tensor>, OpPow<any, Tensor>,
+  OpNeg<Tensor>, OpLen, OpToString
+
+  -- Bumped once per `backward()`; a node is "already visited on this walk"
+  -- when its own mark matches. Cheaper than a visited set, and it needs no
+  -- way to hash a Tensor.
+  static local epoch: integer = 0
+
+  local value: NDArray
+  local grad: NDArray?
+  local parents: table<Tensor>
+  local step: (fn() -> nil)?
+  local needsGrad: boolean
+  local mark: integer
+  local label: string
+
+  --- A leaf that does not take part in differentiation — training data,
+  --- targets, constants.
+  ---
+  --- `mark` and `label` are assigned here rather than declared with
+  --- defaults: on Saule 26.1 an instance built from inside a `static fn` of
+  --- its own class — which is every `Tensor.node` below — skips field
+  --- defaults and leaves them nil.
+  fn init(value: NDArray)
+    self.value = value
+    self.parents = {}
+    self.needsGrad = false
+    self.mark = 0
+    self.label = ""
+  end
+
+  --- A leaf the optimiser is allowed to move: weights and biases.
+  static fn parameter(value: NDArray, label: string = "") -> Tensor
+    local t: Tensor = Tensor(value)
+    t.markTrainable(label)
+
+    return t
+  end
+
+  --- A constant leaf. The same as the constructor, named for intent.
+  static fn constant(value: NDArray) -> Tensor
+    return Tensor(value)
+  end
+
+  --- A constant leaf holding a single number.
+  static fn scalar(value: float) -> Tensor
+    return Tensor(Num.scalar(value))
+  end
+
+  --- Read an operand as a tensor. A `Tensor` passes through; an `NDArray`,
+  --- a `float` or a `table<float>` becomes a constant leaf, so
+  --- `x * 2.0` and `x + bias` mean what they look like.
+  static fn coerce(other: any) -> Tensor
+    local tensor: Tensor? = other as Tensor
+
+    if tensor != nil then
+      return tensor!
+    end
+
+    -- `NDArray.coerce` already understands floats, tables and arrays, and
+    -- refuses an integer with the right message. Reuse it rather than
+    -- re-deciding here.
+    return Tensor(NDArray.coerce(other))
+  end
+
+  --- An interior node: a value plus the inputs it came from. It needs a
+  --- gradient exactly when one of its inputs does, so a forward pass over
+  --- frozen data builds no tape at all.
+  ---
+  --- This is the hook for a custom operation: build the node, then hand it
+  --- a closure with `setBackward`.
+  static fn node(value: NDArray, parents: table<Tensor>) -> Tensor
+    local t: Tensor = Tensor(value)
+    t.adopt(parents)
+
+    return t
+  end
+
+  fn markTrainable(label: string) -> nil
+    self.needsGrad = true
+    self.label = label
+  end
+
+  fn adopt(parents: table<Tensor>) -> nil
+    self.parents = parents
+
+    for p: Tensor in parents do
+      if p.needsGrad then
+        self.needsGrad = true
+      end
+    end
+  end
+
+  --- Install the closure that pushes this node's gradient into its inputs.
+  --- It runs during `backward()`, reads `gradient()`, and calls
+  --- `accumulate` on each input.
+  fn setBackward(step: fn() -> nil) -> nil
+    if self.needsGrad then
+      self.step = step
+    end
+  end
+
+  -- -------------------------------------------------------------- access
+
+  --- The forward value.
+  fn getValue() -> NDArray
+    return self.value
+  end
+
+  --- The shape of the forward value.
+  fn getShape() -> table<integer>
+    return self.value.getShape()
+  end
+
+  --- `#t` — the element count of the forward value.
+  fn len() -> integer
+    return self.value.size()
+  end
+
+  --- The single number in a one-element tensor — how a loss is read out.
+  fn item() -> float
+    return self.value.item()
+  end
+
+  --- Does this tensor take part in differentiation?
+  fn requiresGrad() -> boolean
+    return self.needsGrad
+  end
+
+  --- The name given to a parameter, for error messages and printing.
+  fn getLabel() -> string
+    return self.label
+  end
+
+  --- The accumulated gradient, or zeros if nothing has reached this tensor
+  --- yet. Always the shape of the value.
+  fn gradient() -> NDArray
+    local g: NDArray? = self.grad
+
+    if g == nil then
+      return Num.zerosLike(self.value)
+    end
+
+    return g!
+  end
+
+  --- Has any gradient reached this tensor?
+  fn hasGradient() -> boolean
+    return self.grad != nil
+  end
+
+  --- Add `g` into this tensor's gradient, reducing it back to this
+  --- tensor's shape first. Custom backward closures call this.
+  fn accumulate(g: NDArray) -> nil
+    if not self.needsGrad then
+      return
+    end
+
+    local reduced: NDArray = unbroadcast(g, self.value.getShape())
+
+    if self.grad == nil then
+      -- Copy: `unbroadcast` hands back its argument unchanged when no
+      -- reduction was needed, and that array belongs to the node upstream.
+      self.grad = reduced.copy()
+    else
+      self.grad!.addInPlace(reduced)
+    end
+  end
+
+  --- Drop the accumulated gradient. Leaves keep theirs between steps, so
+  --- an optimiser clears them before each backward pass.
+  fn zeroGrad() -> nil
+    self.grad = nil
+  end
+
+  --- Overwrite the forward value, leaving the graph alone.
+  fn setValue(value: NDArray) -> nil
+    self.value = value
+  end
+
+  --- A leaf holding the same numbers, cut out of the graph — PyTorch's
+  --- `.detach()`. Gradients stop here.
+  fn detach() -> Tensor
+    return Tensor(self.value.copy())
+  end
+
+  -- ------------------------------------------------------------ backward
+
+  --- Seed this tensor's gradient with ones and push it all the way back to
+  --- the leaves. Call it on a scalar loss; on a non-scalar it
+  --- differentiates the sum of the elements, the convention numpy takes.
+  fn backward() -> nil
+    Tensor.epoch = Tensor.epoch + 1
+
+    local order: table<Tensor> = {}
+    self.collect(order)
+
+    self.grad = Num.onesLike(self.value)
+
+    for i: integer = #order, 1, -1 do
+      local node: Tensor = order[i]
+      local step: (fn() -> nil)? = node.step
+
+      if step != nil then
+        step!()
+      end
+    end
+  end
+
+  --- Depth-first post-order: a node lands in `order` only after every node
+  --- it depends on, so walking the result backwards visits each node once
+  --- its own gradient is complete.
+  local fn collect(order: table<Tensor>) -> nil
+    if self.mark == Tensor.epoch then
+      return
+    end
+
+    self.mark = Tensor.epoch
+
+    for p: Tensor in self.parents do
+      p.collect(order)
+    end
+
+    order[#order + 1] = self
+  end
+
+  -- ------------------------------------------------------- binary ops
+
+  --- `a + b`, broadcasting. Gradient flows unchanged to both sides.
+  fn add(other: any) -> Tensor
+    local lhs: Tensor = self
+    local rhs: Tensor = Tensor.coerce(other)
+    local out: Tensor = Tensor.node(lhs.value + rhs.value, {lhs, rhs})
+
+    out.setBackward(fn()
+      local g: NDArray = out.gradient()
+      lhs.accumulate(g)
+      rhs.accumulate(g)
+    end)
+
+    return out
+  end
+
+  --- `a - b`, broadcasting.
+  fn sub(other: any) -> Tensor
+    local lhs: Tensor = self
+    local rhs: Tensor = Tensor.coerce(other)
+    local out: Tensor = Tensor.node(lhs.value - rhs.value, {lhs, rhs})
+
+    out.setBackward(fn()
+      local g: NDArray = out.gradient()
+      lhs.accumulate(g)
+      rhs.accumulate(-g)
+    end)
+
+    return out
+  end
+
+  --- `a * b` — elementwise, broadcasting. Each side's gradient is the
+  --- upstream one times the *other* side's value.
+  fn mul(other: any) -> Tensor
+    local lhs: Tensor = self
+    local rhs: Tensor = Tensor.coerce(other)
+    local out: Tensor = Tensor.node(lhs.value * rhs.value, {lhs, rhs})
+
+    out.setBackward(fn()
+      local g: NDArray = out.gradient()
+      lhs.accumulate(g * rhs.value)
+      rhs.accumulate(g * lhs.value)
+    end)
+
+    return out
+  end
+
+  --- `a / b`, broadcasting.
+  fn div(other: any) -> Tensor
+    local lhs: Tensor = self
+    local rhs: Tensor = Tensor.coerce(other)
+    local out: Tensor = Tensor.node(lhs.value / rhs.value, {lhs, rhs})
+
+    out.setBackward(fn()
+      local g: NDArray = out.gradient()
+      lhs.accumulate(g / rhs.value)
+      rhs.accumulate(-(g * lhs.value / (rhs.value * rhs.value)))
+    end)
+
+    return out
+  end
+
+  --- `a ^ b`, broadcasting — `x ^ 2.0` squares every element.
+  ---
+  --- The exponent has to be a constant. Differentiating with respect to an
+  --- exponent needs `log(base)`, which is not a real number for a negative
+  --- base, so rather than hand back a quiet NaN this refuses.
+  fn pow(other: any) -> Tensor
+    local lhs: Tensor = self
+    local rhs: Tensor = Tensor.coerce(other)
+
+    if rhs.needsGrad then
+      throw "zenith: `^` cannot differentiate with respect to its exponent"
+    end
+
+    local out: Tensor = Tensor.node(lhs.value ^ rhs.value, {lhs, rhs})
+
+    out.setBackward(fn()
+      -- d/dx xⁿ = n·xⁿ⁻¹
+      local slope: NDArray = (lhs.value ^ (rhs.value - 1.0)) * rhs.value
+      lhs.accumulate(out.gradient() * slope)
+    end)
+
+    return out
+  end
+
+  --- `-a`.
+  fn neg() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(-lhs.value, {lhs})
+
+    out.setBackward(fn()
+      lhs.accumulate(-out.gradient())
+    end)
+
+    return out
+  end
+
+  --- Matrix product, rank 2 only — `(batch, in) @ (in, out)`. This is the
+  --- one operation here whose backward pass is not elementwise:
+  --- `dA = g @ Bᵀ` and `dB = Aᵀ @ g`.
+  fn matmul(other: any) -> Tensor
+    local lhs: Tensor = self
+    local rhs: Tensor = Tensor.coerce(other)
+
+    if lhs.value.rank() != 2 or rhs.value.rank() != 2 then
+      throw "zenith: Tensor.matmul needs two rank-2 tensors, got "
+        .. lhs.value.shapeString() .. " and " .. rhs.value.shapeString()
+    end
+
+    local out: Tensor = Tensor.node(lhs.value.matmul(rhs.value), {lhs, rhs})
+
+    out.setBackward(fn()
+      local g: NDArray = out.gradient()
+      lhs.accumulate(g.matmul(rhs.value.transpose()))
+      rhs.accumulate(lhs.value.transpose().matmul(g))
+    end)
+
+    return out
+  end
+
+  -- -------------------------------------------------------- unary ops
+
+  --- `e^x` elementwise.
+  fn exp() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.exp(), {lhs})
+
+    out.setBackward(fn()
+      -- d/dx e^x is e^x, which the forward pass already computed.
+      lhs.accumulate(out.gradient() * out.value)
+    end)
+
+    return out
+  end
+
+  --- Natural log elementwise.
+  fn log() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.log(), {lhs})
+
+    out.setBackward(fn()
+      lhs.accumulate(out.gradient() / lhs.value)
+    end)
+
+    return out
+  end
+
+  --- Square root elementwise.
+  fn sqrt() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.sqrt(), {lhs})
+
+    out.setBackward(fn()
+      lhs.accumulate(out.gradient() / (out.value * 2.0))
+    end)
+
+    return out
+  end
+
+  --- `tanh` elementwise. Its derivative is `1 - tanh(x)²`.
+  fn tanh() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.tanh(), {lhs})
+
+    out.setBackward(fn()
+      local slope: NDArray = (out.value * out.value).neg() + 1.0
+      lhs.accumulate(out.gradient() * slope)
+    end)
+
+    return out
+  end
+
+  --- `max(x, 0)` elementwise. The derivative is the step function; the
+  --- kink at zero is assigned a slope of 0, as every framework does.
+  fn relu() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.maximum(0.0), {lhs})
+
+    out.setBackward(fn()
+      lhs.accumulate(out.gradient() * lhs.value.step())
+    end)
+
+    return out
+  end
+
+  --- Logistic sigmoid, `1 / (1 + e^-x)`.
+  fn sigmoid() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.sigmoid(), {lhs})
+
+    out.setBackward(fn()
+      -- σ'(x) = σ(x)(1 - σ(x)), again reusing the forward value.
+      local slope: NDArray = out.value * (out.value.neg() + 1.0)
+      lhs.accumulate(out.gradient() * slope)
+    end)
+
+    return out
+  end
+
+  -- ------------------------------------------------------- reductions
+
+  --- Sum of every element, as a one-element tensor.
+  fn sum() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(Num.scalar(lhs.value.sum()), {lhs})
+
+    out.setBackward(fn()
+      -- Every element contributed exactly once.
+      lhs.accumulate(Num.full(lhs.value.getShape(), out.gradient().item()))
+    end)
+
+    return out
+  end
+
+  --- Mean of every element, as a one-element tensor.
+  fn mean() -> Tensor
+    local lhs: Tensor = self
+    local count: integer = lhs.value.size()
+    local out: Tensor = Tensor.node(Num.scalar(lhs.value.mean()), {lhs})
+
+    out.setBackward(fn()
+      local share: float = out.gradient().item() / (count as float)
+      lhs.accumulate(Num.full(lhs.value.getShape(), share))
+    end)
+
+    return out
+  end
+
+  --- Sum along one axis. `keepDims` holds the axis open at extent 1.
+  fn sumAxis(axis: integer, keepDims: boolean = false) -> Tensor
+    local lhs: Tensor = self
+    local kept: table<integer> = lhs.value.getShape()
+    kept[axis] = 1
+
+    local out: Tensor = Tensor.node(lhs.value.sumAxis(axis, keepDims), {lhs})
+
+    out.setBackward(fn()
+      -- Undo the collapse: every position along the axis gets the same
+      -- gradient back.
+      local g: NDArray = out.gradient().reshape(kept)
+      lhs.accumulate(g.broadcastTo(lhs.value.getShape()))
+    end)
+
+    return out
+  end
+
+  --- Mean along one axis.
+  fn meanAxis(axis: integer, keepDims: boolean = false) -> Tensor
+    local lhs: Tensor = self
+    local kept: table<integer> = lhs.value.getShape()
+    local extent: integer = kept[axis]
+    kept[axis] = 1
+
+    local out: Tensor = Tensor.node(lhs.value.meanAxis(axis, keepDims), {lhs})
+
+    out.setBackward(fn()
+      local g: NDArray = out.gradient().reshape(kept) / (extent as float)
+      lhs.accumulate(g.broadcastTo(lhs.value.getShape()))
+    end)
+
+    return out
+  end
+
+  --- `softmax` along one axis: exponentials normalised to sum to 1.
+  ---
+  --- Built from the operators above, so its gradient comes from the chain
+  --- rule rather than from a hand-written rule. The row maximum is
+  --- subtracted first as a *constant* — mathematically a no-op on the
+  --- result, and the difference between an answer and an overflow.
+  fn softmax(axis: integer = 2) -> Tensor
+    local shift: Tensor = Tensor.constant(self.value.maxAxis(axis, true))
+    local raised: Tensor = (self - shift).exp()
+
+    return raised / raised.sumAxis(axis, true)
+  end
+
+  -- ------------------------------------------------------------ reshape
+
+  --- The same elements under a new shape.
+  fn reshape(dims: table<integer>) -> Tensor
+    local lhs: Tensor = self
+    local original: table<integer> = lhs.value.getShape()
+    local out: Tensor = Tensor.node(lhs.value.reshape(dims), {lhs})
+
+    out.setBackward(fn()
+      lhs.accumulate(out.gradient().reshape(original))
+    end)
+
+    return out
+  end
+
+  --- Axes reversed.
+  fn transpose() -> Tensor
+    local lhs: Tensor = self
+    local out: Tensor = Tensor.node(lhs.value.transpose(), {lhs})
+
+    out.setBackward(fn()
+      lhs.accumulate(out.gradient().transpose())
+    end)
+
+    return out
+  end
+
+  -- ---------------------------------------------------------- rendering
+
+  fn toString() -> string
+    local head: string = "Tensor"
+
+    if self.label != "" then
+      head = "Tensor " .. self.label
+    end
+
+    local tail: string = ""
+
+    if self.needsGrad then
+      tail = " grad"
+    end
+
+    return head .. self.value.shapeString() .. tail .. " " .. tostring(self.value)
+  end
+end
